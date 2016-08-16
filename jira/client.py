@@ -37,11 +37,23 @@ import xml.etree.ElementTree as etree
 import calendar
 import hashlib
 from numbers import Number
+import requests
 
 # noinspection PyUnresolvedReferences
-from six.moves.urllib.parse import urlparse, urlencode
+from six.moves.urllib.parse import urlparse
 from six import iteritems
 from requests.utils import get_netrc_auth
+# JIRA specific resources
+from .resources import Resource, Issue, Comment, Project, Attachment, Component, Dashboard, Filter, Votes, Watchers, \
+    Worklog, IssueLink, IssueLinkType, IssueType, Priority, Version, Role, Resolution, SecurityLevel, Status, User, \
+    CustomFieldOption, RemoteLink
+# GreenHopper specific resources
+from .resources import GreenHopperResource, Board, Sprint
+from .resilientsession import ResilientSession, raise_on_error
+from . import __version__
+from .utils import threaded_requests, json_loads, CaseInsensitiveDict
+from .exceptions import JIRAError
+from pkg_resources import parse_version
 
 try:
     from collections import OrderedDict
@@ -56,7 +68,6 @@ if sys.version_info < (3, 0, 0):
     import HTMLParser as html_parser
 else:
     import html.parser as html_parser
-import requests
 try:
     # noinspection PyUnresolvedReferences
     from requests_toolbelt import MultipartEncoder
@@ -68,28 +79,13 @@ try:
 except ImportError:
     pass
 
-# JIRA specific resources
-from .resources import Resource, Issue, Comment, Project, Attachment, Component, Dashboard, Filter, Votes, Watchers, \
-    Worklog, IssueLink, IssueLinkType, IssueType, Priority, Version, Role, Resolution, SecurityLevel, Status, User, \
-    CustomFieldOption, RemoteLink
-# GreenHopper specific resources
-from .resources import GreenHopperResource, Board, Sprint
-from .resilientsession import ResilientSession, raise_on_error
-from .version import __version__
-from .utils import threaded_requests, json_loads, CaseInsensitiveDict
-from .exceptions import JIRAError
-try:
-    from random import SystemRandom
-
-    random = SystemRandom()
-except ImportError:
-    import random
-
 # warnings.simplefilter('default')
 
 # encoding = sys.getdefaultencoding()
 # if encoding != 'UTF8':
-#    warnings.warning("Python default encoding is '%s' instead of 'UTF8' which means that there is a big change of having problems. Possible workaround http://stackoverflow.com/a/17628350/99834" % encoding)
+#    warnings.warning("Python default encoding is '%s' instead of 'UTF8' " \
+#    "which means that there is a big change of having problems. " \
+#    "Possible workaround http://stackoverflow.com/a/17628350/99834" % encoding)
 
 logging.getLogger('jira').addHandler(NullHandler())
 
@@ -176,18 +172,15 @@ class JIRA(object):
         "resilient": True,
         "async": False,
         "client_cert": None,
-        "check_update": True,
+        "check_update": False,
         "headers": {
-            'X-Atlassian-Token': 'no-check',
             'Cache-Control': 'no-cache',
             # 'Accept': 'application/json;charset=UTF-8',  # default for REST
             'Content-Type': 'application/json',  # ;charset=UTF-8',
             # 'Accept': 'application/json',  # default for REST
-
             # 'Pragma': 'no-cache',
             # 'Expires': 'Thu, 01 Jan 1970 00:00:00 GMT'
-        }
-    }
+            'X-Atlassian-Token': 'no-check'}}
 
     checked_version = False
 
@@ -196,7 +189,7 @@ class JIRA(object):
     AGILE_BASE_URL = GreenHopperResource.AGILE_BASE_URL
 
     def __init__(self, server=None, options=None, basic_auth=None, oauth=None, jwt=None, kerberos=False,
-                 validate=False, get_server_info=True, async=False, logging=True, max_retries=3):
+                 validate=False, get_server_info=True, async=False, logging=True, max_retries=3, proxies=None):
         """
         Construct a JIRA client instance.
 
@@ -244,6 +237,10 @@ class JIRA(object):
         :param async: To enable async requests for those actions where we implemented it, like issue update() or delete().
         Obviously this means that you cannot rely on the return code when this is enabled.
         """
+        # force a copy of the tuple to be used in __del__() because
+        # sys.version_info could have already been deleted in __del__()
+        self.sys_version_info = tuple([i for i in sys.version_info])
+
         if options is None:
             options = {}
             if server and hasattr(server, 'keys'):
@@ -293,6 +290,9 @@ class JIRA(object):
 
         self._session.max_retries = max_retries
 
+        if proxies:
+            self._session.proxies = proxies
+
         if validate:
             # This will raise an Exception if you are not allowed to login.
             # It's better to fail faster than later.
@@ -323,10 +323,10 @@ class JIRA(object):
     def _check_update_(self):
         # check if the current version of the library is outdated
         try:
-            data = requests.get("http://pypi.python.org/pypi/jira/json", timeout=2.001).json()
+            data = requests.get("https://pypi.python.org/pypi/jira/json", timeout=2.001).json()
 
             released_version = data['info']['version']
-            if released_version > __version__:
+            if parse_version(released_version) > parse_version(__version__):
                 warnings.warn(
                     "You are running an outdated version of JIRA Python %s. Current version is %s. Do not file any bugs against older versions." % (
                         __version__, released_version))
@@ -338,8 +338,15 @@ class JIRA(object):
     def __del__(self):
         session = getattr(self, "_session", None)
         if session is not None:
-            if sys.version_info < (3, 4, 0):  # workaround for https://github.com/kennethreitz/requests/issues/2303
-                session.close()
+            if self.sys_version_info < (3, 4, 0):  # workaround for https://github.com/kennethreitz/requests/issues/2303
+                try:
+                    session.close()
+                except TypeError:
+                    # TypeError: "'NoneType' object is not callable"
+                    # Could still happen here because other references are also
+                    # in the process to be torn down, see warning section in
+                    # https://docs.python.org/2/reference/datamodel.html#object.__del__
+                    pass
 
     def _check_for_html_error(self, content):
         # TODO: Make it return errors when content is a webpage with errors
@@ -479,9 +486,8 @@ class JIRA(object):
             '/rest/api/latest/application-properties/' + key
         payload = {
             'id': key,
-            'value': value
-        }
-        r = self._session.put(
+            'value': value}
+        return self._session.put(
             url, data=json.dumps(payload))
 
     def applicationlinks(self, cached=True):
@@ -558,8 +564,7 @@ class JIRA(object):
             def file_stream():
                 return MultipartEncoder(
                     fields={
-                        'file': (fname, attachment, 'application/octet-stream')}
-                )
+                        'file': (fname, attachment, 'application/octet-stream')})
             m = file_stream()
             r = self._session.post(
                 url, data=m, headers=CaseInsensitiveDict({'content-type': m.content_type, 'X-Atlassian-Token': 'nocheck'}), retry_data=file_stream)
@@ -598,8 +603,7 @@ class JIRA(object):
         data = {
             'name': name,
             'project': project,
-            'isAssigneeTypeValid': isAssigneeTypeValid
-        }
+            'isAssigneeTypeValid': isAssigneeTypeValid}
         if description is not None:
             data['description'] = description
         if leadUserName is not None:
@@ -785,7 +789,7 @@ class JIRA(object):
 
         result = {}
         for user in r['users']['items']:
-            result[user['name']] = {'fullname': user['displayName'], 'email': user.get('emailAddress', 'hidden') ,
+            result[user['name']] = {'fullname': user['displayName'], 'email': user.get('emailAddress', 'hidden'),
                                     'active': user['active']}
         return result
 
@@ -836,7 +840,7 @@ class JIRA(object):
         """
 
         # this allows us to pass Issue objects to issue()
-        if type(id) == Issue:
+        if isinstance(id, Issue):
             return id
 
         issue = Issue(self._options, self._session)
@@ -879,6 +883,7 @@ class JIRA(object):
             data['fields'] = fields_dict
 
         p = data['fields']['project']
+
         if isinstance(p, string_types) or isinstance(p, integer_types):
             data['fields']['project'] = {'id': self.project(p).id}
 
@@ -981,8 +986,7 @@ class JIRA(object):
         viewing of this comment will be restricted.
         """
         data = {
-            'body': body
-        }
+            'body': body}
         if visibility is not None:
             data['visibility'] = visibility
 
@@ -1055,18 +1059,15 @@ class JIRA(object):
                 "Unable to gather applicationlinks; you will not be able "
                 "to add links to remote issues: (%s) %s" % (
                     e.status_code,
-                    e.text
-                ),
-                Warning
-            )
+                    e.text),
+                Warning)
 
         data = {}
-        if type(destination) == Issue:
+        if isinstance(destination, Issue):
 
             data['object'] = {
                 'title': str(destination),
-                'url': destination.permalink()
-            }
+                'url': destination.permalink()}
 
             for x in applicationlinks:
                 if x['application']['displayUrl'] == destination._options['server']:
@@ -1108,9 +1109,13 @@ class JIRA(object):
 
     def add_simple_link(self, issue, object):
         """
-        Add a simple remote link from an issue to web resource.  This avoids the admin access problems from add_remote_link by just using a simple object and presuming all fields are correct and not requiring more complex ``application`` data.
-            ``object`` should be a dict containing at least ``url`` to the linked external URL
-             and ``title`` to display for the link inside JIRA.
+        Add a simple remote link from an issue to web resource. This avoids
+        the admin access problems from add_remote_link by just using a simple
+        object and presuming all fields are correct and not requiring more
+        complex ``application`` data.
+
+        ``object`` should be a dict containing at least ``url`` to the
+        linked external URL and ``title`` to display for the link inside JIRA.
 
         For definitions of the allowable fields for ``object`` , see https://developer.atlassian.com/display/JIRADEV/JIRA+REST+API+for+Remote+Issue+Links.
 
@@ -1118,11 +1123,7 @@ class JIRA(object):
         :param object: the dictionary used to create remotelink data
         """
 
-        data = {}
-
-        # hard code data dict to be passed as ``object`` to avoid any permissions errors
-        data = object
-
+        data = {"object": object}
         url = self._get_url('issue/' + str(issue) + '/remotelink')
         r = self._session.post(
             url, data=json.dumps(data))
@@ -1194,9 +1195,7 @@ class JIRA(object):
 
         data = {
             'transition': {
-                'id': transitionId
-            }
-        }
+                'id': transitionId}}
         if comment:
             data['update'] = {'comment': [{'add': {'body': comment}}]}
         if fields is not None:
@@ -1234,7 +1233,7 @@ class JIRA(object):
         :param issue: ID or key of the issue to vote on
         """
         url = self._get_url('issue/' + str(issue) + '/votes')
-        r = self._session.post(url)
+        return self._session.post(url)
 
     @translate_resource_args
     def remove_vote(self, issue):
@@ -1388,18 +1387,14 @@ class JIRA(object):
 
         data = {
             'type': {
-                'name': type
-            },
+                'name': type},
             'inwardIssue': {
-                'key': inwardIssue
-            },
+                'key': inwardIssue},
             'outwardIssue': {
-                'key': outwardIssue
-            },
-            'comment': comment
-        }
+                'key': outwardIssue},
+            'comment': comment}
         url = self._get_url('issueLink')
-        r = self._session.post(
+        return self._session.post(
             url, data=json.dumps(data))
 
     def delete_issue_link(self, id):
@@ -1410,7 +1405,7 @@ class JIRA(object):
         """
 
         url = self._get_url('issueLink') + "/" + id
-        r = self.jira._session.delete(url)
+        return self._session.delete(url)
 
     def issue_link(self, id):
         """
@@ -1561,8 +1556,7 @@ class JIRA(object):
 
         params = {
             'filename': filename,
-            'size': size
-        }
+            'size': size}
 
         headers = {'X-Atlassian-Token': 'no-check'}
         if contentType is not None:
@@ -1621,7 +1615,7 @@ class JIRA(object):
         :param avatar: ID of the avater to delete
         """
         url = self._get_url('project/' + project + '/avatar/' + avatar)
-        r = self._session.delete(url)
+        return self._session.delete(url)
 
     @translate_resource_args
     def project_components(self, project):
@@ -1656,7 +1650,7 @@ class JIRA(object):
         :param project: ID or key of the project to get roles from
         """
         roles_dict = self._get_json('project/' + project + '/role')
-
+        return roles_dict
         # TODO: return on a list of Roles()
 
     @translate_resource_args
@@ -1727,8 +1721,7 @@ class JIRA(object):
             "maxResults": maxResults,
             "validateQuery": validate_query,
             "fields": fields,
-            "expand": expand
-        }
+            "expand": expand}
         if json_result:
             if not maxResults:
                 warnings.warn('All issues cannot be fetched at once, when json_result parameter is set', Warning)
@@ -1815,8 +1808,7 @@ class JIRA(object):
         """
         params = {
             'username': username,
-            'projectKeys': projectKeys,
-        }
+            'projectKeys': projectKeys}
         return self._fetch_pages(User, None, 'user/assignable/multiProjectSearch', startAt, maxResults, params)
 
     def search_assignable_users_for_issues(self, username, project=None, issueKey=None, expand=None, startAt=0,
@@ -1838,8 +1830,7 @@ class JIRA(object):
                 If maxResults evaluates as False, it will try to get all items in batches.
         """
         params = {
-            'username': username
-        }
+            'username': username}
         if project is not None:
             params['project'] = project
         if issueKey is not None:
@@ -1892,8 +1883,7 @@ class JIRA(object):
         params = {
             'username': user,
             'filename': filename,
-            'size': size
-        }
+            'size': size}
 
         headers = {'X-Atlassian-Token': 'no-check'}
         if contentType is not None:
@@ -1950,7 +1940,7 @@ class JIRA(object):
         """
         params = {'username': username}
         url = self._get_url('user/avatar/' + avatar)
-        r = self._session.delete(url, params=params)
+        return self._session.delete(url, params=params)
 
     def search_users(self, user, startAt=0, maxResults=50, includeActive=True, includeInactive=False):
         """
@@ -1966,8 +1956,7 @@ class JIRA(object):
         params = {
             'username': user,
             'includeActive': includeActive,
-            'includeInactive': includeInactive
-        }
+            'includeInactive': includeInactive}
         return self._fetch_pages(User, None, 'user/search', startAt, maxResults, params)
 
     def search_allowed_users_for_issue(self, user, issueKey=None, projectKey=None, startAt=0, maxResults=50):
@@ -1983,8 +1972,7 @@ class JIRA(object):
                 If maxResults evaluates as False, it will try to get all items in batches.
         """
         params = {
-            'username': user
-        }
+            'username': user}
         if issueKey is not None:
             params['issueKey'] = issueKey
         if projectKey is not None:
@@ -2009,8 +1997,7 @@ class JIRA(object):
             'name': name,
             'project': project,
             'archived': archived,
-            'released': released
-        }
+            'released': released}
         if description is not None:
             data['description'] = description
         if releaseDate is not None:
@@ -2086,7 +2073,7 @@ class JIRA(object):
         """Get a dict of the current authenticated user's session information."""
         url = '{server}/rest/auth/1/session'.format(**self._options)
 
-        if type(self._session.auth) is tuple:
+        if isinstance(self._session.auth, tuple):
             authentication_data = {
                 'username': self._session.auth[0], 'password': self._session.auth[1]}
             r = self._session.post(url, data=json.dumps(authentication_data))
@@ -2099,14 +2086,14 @@ class JIRA(object):
     def kill_session(self):
         """Destroy the session of the current authenticated user."""
         url = self._options['server'] + '/rest/auth/latest/session'
-        r = self._session.delete(url)
+        return self._session.delete(url)
 
     # Websudo
 
     def kill_websudo(self):
         """Destroy the user's current WebSudo session."""
         url = self._options['server'] + '/rest/auth/1/websudo'
-        r = self._session.delete(url)
+        return self._session.delete(url)
 
     # Utilities
     def _create_http_basic_session(self, username, password):
@@ -2127,8 +2114,7 @@ class JIRA(object):
             rsa_key=oauth['key_cert'],
             signature_method=SIGNATURE_RSA,
             resource_owner_key=oauth['access_token'],
-            resource_owner_secret=oauth['access_token_secret']
-        )
+            resource_owner_secret=oauth['access_token_secret'])
         self._session = ResilientSession()
         self._session.verify = verify
         self._session.auth = oauth
@@ -2166,9 +2152,8 @@ class JIRA(object):
 
     def _set_avatar(self, params, url, avatar):
         data = {
-            'id': avatar
-        }
-        r = self._session.put(url, params=params, data=json.dumps(data))
+            'id': avatar}
+        return self._session.put(url, params=params, data=json.dumps(data))
 
     def _get_url(self, path, base=JIRA_BASE_URL):
         options = self._options.copy()
@@ -2191,6 +2176,8 @@ class JIRA(object):
         if expand is not None:
             params['expand'] = expand
         resource.find(id=ids, params=params)
+        if not resource:
+            raise JIRAError("Unable to find resource %s(%s)", resource_cls, ids)
         return resource
 
     def _try_magic(self):
@@ -2242,8 +2229,7 @@ class JIRA(object):
             'cannedScriptArgs_FIELD_PREVIEW_ISSUE': '',
             'cannedScript': 'com.onresolve.jira.groovy.canned.workflow.postfunctions.SendCustomEmail',
             'id': '',
-            'Preview': 'Preview',
-        }
+            'Preview': 'Preview'}
 
         r = self._session.post(
             url, headers=self._options['headers'], data=payload)
@@ -2261,11 +2247,9 @@ class JIRA(object):
 
             url = self._options['server'] + '/rest/api/latest/user'
             payload = {
-                "name": new_user,
-            }
+                "name": new_user}
             params = {
-                'username': old_user
-            }
+                'username': old_user}
 
             # raw displayName
             logging.debug("renaming %s" % self.user(old_user).emailAddress)
@@ -2288,8 +2272,7 @@ class JIRA(object):
                 "cannedScriptArgs_FIELD_TO_USER_ID": new_user,
                 "cannedScriptArgs_FIELD_MERGE": merge,
                 "id": "",
-                "RunCanned": "Run",
-            }
+                "RunCanned": "Run"}
 
             # raw displayName
             logging.debug("renaming %s" % self.user(old_user).emailAddress)
@@ -2298,7 +2281,8 @@ class JIRA(object):
                 url, headers=self._options['headers'], data=payload)
             if r.status_code == 404:
                 logging.error(
-                    "In order to be able to use rename_user() you need to install Script Runner plugin. See https://marketplace.atlassian.com/plugins/com.onresolve.jira.groovy.groovyrunner")
+                    "In order to be able to use rename_user() you need to install Script Runner plugin. "
+                    "See https://marketplace.atlassian.com/plugins/com.onresolve.jira.groovy.groovyrunner")
                 return False
             if r.status_code != 200:
                 logging.error(r.status_code)
@@ -2347,6 +2331,37 @@ class JIRA(object):
             logging.error(r.status_code)
             return False
 
+    def deactivate_user(self, username):
+        """
+        Disables/deactivates the user.
+        """
+        if self.server_info().get('deploymentType') == 'Cloud':
+            url = self._options['server'] + '/admin/rest/um/1/user/deactivate?username=' + username
+            self._options['headers']['Content-Type'] = 'application/json'
+            userInfo = {}
+        else:
+            url = self._options['server'] + '/secure/admin/user/EditUser.jspa'
+            self._options['headers']['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+            user = self.user(username)
+            userInfo = {
+                'inline': 'true',
+                'decorator': 'dialog',
+                'username': user.name,
+                'fullName': user.displayName,
+                'email': user.emailAddress,
+                'editName': user.name
+            }
+        try:
+            r = self._session.post(url, headers=self._options['headers'], data=userInfo)
+            if r.status_code == 200:
+                return True
+            else:
+                logging.warning(
+                    'Got response from deactivating %s: %s' % (username, r.status_code))
+                return r.status_code
+        except Exception as e:
+            print("Error Deactivating %s: %s" % (username, e))
+
     def reindex(self, force=False, background=True):
         """
         Start jira re-indexing. Returns True if reindexing is in progress or not needed, or False.
@@ -2386,11 +2401,11 @@ class JIRA(object):
                 logging.error("Failed to reindex jira, probably a bug.")
                 return False
 
-    def backup(self, filename='backup.zip', cloud=False, attachments=False):
+    def backup(self, filename='backup.zip', attachments=False):
         """
         Will call jira export to backup as zipped xml. Returning with success does not mean that the backup process finished.
         """
-        if cloud:
+        if self.server_info().get('deploymentType') == 'Cloud':
             url = self._options['server'] + '/rest/obm/1.0/runbackup'
             payload = json.dumps({"cbAttachments": attachments})
             self._options['headers']['X-Requested-With'] = 'XMLHttpRequest'
@@ -2398,7 +2413,7 @@ class JIRA(object):
             url = self._options['server'] + '/secure/admin/XmlBackup.jspa'
             payload = {'filename': filename}
         try:
-            r = self._session.post( url, headers=self._options['headers'], data=payload)
+            r = self._session.post(url, headers=self._options['headers'], data=payload)
             if r.status_code == 200:
                 return True
             else:
@@ -2406,24 +2421,22 @@ class JIRA(object):
                     'Got %s response from calling backup.' % r.status_code)
                 return r.status_code
         except Exception as e:
-            print("I see %s" % e)
+            logging.error("I see %s", e)
 
-    def backup_progress(self, cloud=True):
+    def backup_progress(self):
         """
         Returns status of cloud backup as a dict.
         Is there a way to get progress for Server version?
         """
         epoch_time = int(time.time() * 1000)
-        if cloud:
+        if self.server_info().get('deploymentType') == 'Cloud':
             url = self._options['server'] + '/rest/obm/1.0/getprogress?_=%i' % epoch_time
         else:
             logging.warning(
-                    'This functionality is not available in Server version'
-                    )
+                'This functionality is not available in Server version')
             return None
         r = self._session.get(
-                url, headers=self._options['headers']
-                )
+            url, headers=self._options['headers'])
         # This is weird.  I used to get xml, but now I'm getting json
         try:
             return json.loads(r.text)
@@ -2432,51 +2445,55 @@ class JIRA(object):
             try:
                 root = etree.fromstring(r.text)
             except etree.ParseError as pe:
-                logging.warning(
-                    'Unable to find backup info.  You probably need to initiate a new backup'
-                    )
+                logging.warning('Unable to find backup info.  You probably need to initiate a new backup. %s' % pe)
                 return None
             for k in root.keys():
                 progress[k] = root.get(k)
             return progress
 
-    def backup_complete(self, cloud=True):
+    def backup_complete(self):
         """
         Returns boolean based on 'alternativePercentage' and 'size' returned
         from backup_progress (cloud only)
         """
-        if not cloud:
+        if self.server_info().get('deploymentType') != 'Cloud':
             logging.warning(
-                    'This functionality is not available in Server version'
-                    )
+                'This functionality is not available in Server version')
             return None
-        status = self.backup_progress(cloud=cloud)
+        status = self.backup_progress()
         perc_complete = int(re.search(r"\s([0-9]*)\s",
-                            status['alternativePercentage'] ).group(1))
+                                      status['alternativePercentage']).group(1))
         file_size = int(status['size'])
         return perc_complete >= 100 and file_size > 0
 
-    def backup_download(self, filename=None, cloud=True):
+    def backup_download(self, filename=None):
         """
         Downloads backup file from WebDAV (cloud only)
         """
-        if not cloud:
+        if self.server_info().get('deploymentType') != 'Cloud':
             logging.warning(
-                    'This functionality is not available in Server version'
-                    )
+                'This functionality is not available in Server version')
             return None
-        remote_file = self.backup_progress(cloud=cloud)['fileName']
+        remote_file = self.backup_progress()['fileName']
         local_file = filename or remote_file
         url = self._options['server'] + '/webdav/backupmanager/' + remote_file
         try:
-            r = self._session.get(url, headers=self._options['headers'])
-            with open(local_file, 'bw') as file:
-                file.write(r.content)
+            logging.debug('Writing file to %s' % local_file)
+            with open(local_file, 'wb') as file:
+                try:
+                    resp = self._session.get(url, headers=self._options['headers'], stream=True)
+                except:
+                    raise JIRAError()
+                if not resp.ok:
+                    logging.error("Something went wrong with download: %s" % resp.text)
+                    raise JIRAError(resp.text)
+                for block in resp.iter_content(1024):
+                    file.write(block)
         except JIRAError as je:
-            logging.warning(
-                'Unable to access backup file: %s' % je
-                )
-            return None
+            logging.error('Unable to access remote backup file: %s' % je)
+        except IOError as ioe:
+            logging.error(ioe)
+        return None
 
     def current_user(self):
         if not hasattr(self, '_serverInfo') or 'username' not in self._serverInfo:
@@ -2495,43 +2512,50 @@ class JIRA(object):
 
     def delete_project(self, pid):
         """
-        Project can be id, project key or project name. It will return False if it fails.
+        Deletes project from Jira
+
+        :param str pid:     JIRA projectID or Project or slug
+        :returns bool:      True if project was deleted
+        :raises JIRAError:  If project not found or not enough permissions
+        :raises ValueError: If pid parameter is not Project, slug or ProjectID
         """
-        found = False
+
+        # allows us to call it with Project objects
+        if hasattr(pid, 'id'):
+            pid = pid.id
+
+        # Check if pid is a number - then we assume that it is
+        # projectID
         try:
-            if not str(int(pid)) == pid:
-                found = True
+            str(int(pid)) == pid
         except Exception as e:
+            # pid looks like a slug, lets verify that
             r_json = self._get_json('project')
             for e in r_json:
                 if e['key'] == pid or e['name'] == pid:
                     pid = e['id']
-                    found = True
                     break
-            if not found:
-                logging.error("Unable to recognize project `%s`" % pid)
-                return False
+            else:
+                # pid is not a Project
+                # not a projectID and not a slug - we raise error here
+                raise ValueError('Parameter pid="%s" is not a Project, '
+                                 'projectID or slug' % pid)
 
-        uri = '/secure/project/DeleteProject.jspa'
+        uri = '/rest/api/2/project/%s' % pid
         url = self._options['server'] + uri
-        payload = {'pid': pid, 'Delete': 'Delete', 'confirm': 'true'}
-        # try:
-        #     r = self._gain_sudo_session(payload, uri)
-        #     if r.status_code != 200 or not self._check_for_html_error(r.text):
-        #         return False
-        # except JIRAError as e:
-        #     raise JIRAError(0, "You must have global administrator rights to delete projects.")
-        #     return False
+        try:
+            r = self._session.delete(
+                url, headers={'Content-Type': 'application/json'}
+            )
+        except JIRAError as je:
+            if '403' in str(je):
+                raise JIRAError('Not enough permissions to delete project')
+            if '404' in str(je):
+                raise JIRAError('Project not found in Jira')
+            raise je
 
-        r = self._session.post(
-            url, headers=CaseInsensitiveDict({'content-type': 'application/x-www-form-urlencoded'}), data=payload)
-
-        if r.status_code == 200:
-            return self._check_for_html_error(r.text)
-        else:
-            logging.warning(
-                'Got %s response from calling delete_project.' % r.status_code)
-            return r.status_code
+        if r.status_code == 204:
+            return True
 
     def _gain_sudo_session(self, options, destination):
         url = self._options['server'] + '/secure/admin/WebSudoAuthenticate.jspa'
@@ -2542,29 +2566,26 @@ class JIRA(object):
         payload = {
             'webSudoPassword': self._session.auth[1],
             'webSudoDestination': destination,
-            'webSudoIsPost': 'true',
-        }
+            'webSudoIsPost': 'true'}
 
         payload.update(options)
 
         return self._session.post(
             url, headers=CaseInsensitiveDict({'content-type': 'application/x-www-form-urlencoded'}), data=payload)
 
-    def create_project(self, key, name=None, assignee=None, type="Software"):
+    def create_project(self, key, name=None, assignee=None, type="Software", template_name=None):
         """
         Key is mandatory and has to match JIRA project key requirements, usually only 2-10 uppercase characters.
         If name is not specified it will use the key value.
         If assignee is not specified it will use current user.
+        Parameter template_name is used to create a project based on one of the existing project templates.
+        If template_name is not specified, then it should use one of the default values.
         The returned value should evaluate to False if it fails otherwise it will be the new project id.
         """
         if assignee is None:
             assignee = self.current_user()
         if name is None:
             name = key
-        if key.upper() != key or not key.isalpha() or len(key) < 2 or len(key) > 10:
-            logging.error(
-                'key parameter is not all uppercase alphanumeric of length between 2 and 10')
-            return False
         url = self._options['server'] + \
             '/rest/project-templates/latest/templates'
 
@@ -2575,7 +2596,7 @@ class JIRA(object):
         templates = []
         for template in _get_template_list(j):
             templates.append(template['name'])
-            if template['name'] in ['JIRA Classic', 'JIRA Default Schemes', 'Basic software development']:
+            if template['name'] in ['JIRA Classic', 'JIRA Default Schemes', 'Basic software development', template_name]:
                 template_key = template['projectTemplateModuleCompleteKey']
                 break
 
@@ -2586,12 +2607,12 @@ class JIRA(object):
         payload = {'name': name,
                    'key': key,
                    'keyEdited': 'false',
-                   #'projectTemplate': 'com.atlassian.jira-core-project-templates:jira-issuetracking',
-                   #'permissionScheme': '',
+                   # 'projectTemplate': 'com.atlassian.jira-core-project-templates:jira-issuetracking',
+                   # 'permissionScheme': '',
                    'projectTemplateWebItemKey': template_key,
                    'projectTemplateModuleKey': template_key,
                    'lead': assignee,
-                   #'assigneeType': '2',
+                   # 'assigneeType': '2',
                    }
 
         if self._version[0] > 6:
@@ -2704,17 +2725,16 @@ class JIRA(object):
         if str(customfield).isdigit():
             customfield = "customfield_%s" % customfield
         params = {
-            #'_mode':'view',
+            # '_mode':'view',
+            # 'validate':True,
+            # '_search':False,
+            # 'rows':100,
+            # 'page':1,
+            # 'sidx':'DEFAULT',
+            # 'sord':'asc'
             '_issueId': issueid,
             '_fieldId': customfield,
-            '_confSchemeId': schemeid,
-            #'validate':True,
-            #'_search':False,
-            #'rows':100,
-            #'page':1,
-            #'sidx':'DEFAULT',
-            #'sord':'asc',
-        }
+            '_confSchemeId': schemeid}
         r = self._session.get(
             url, headers=self._options['headers'], params=params)
         return json_loads(r)
@@ -2808,8 +2828,7 @@ class JIRA(object):
             if s.name not in sprints:
                 sprints[s.name] = s.raw
             else:
-                raise (Exception(
-                    "Fatal error, duplicate Sprint Name (%s) found on board %s." % (s.name, id)))
+                raise Exception
         return sprints
 
     def update_sprint(self, id, name=None, startDate=None, endDate=None, state=None):
@@ -2881,7 +2900,7 @@ class JIRA(object):
         issues = [Issue(self._options, self._session, raw_issues_json) for raw_issues_json in
                   r_json['contents']['issuesNotCompletedInCurrentSprint']]
         return issues
-    
+
     def incompletedIssuesEstimateSum(self, board_id, sprint_id):
         """
         Return the total incompleted points this sprint.
@@ -3045,7 +3064,7 @@ class JIRA(object):
             data = {'idOrKeys': issue_keys, 'customFieldId': sprint_field_id,
                     'sprintId': sprint_id, 'addToBacklog': False}
             url = self._get_url('sprint/rank', base=self.AGILE_BASE_URL)
-            r = self._session.put(url, data=json.dumps(data))
+            return self._session.put(url, data=json.dumps(data))
         else:
             raise NotImplementedError('No API for adding issues to sprint for agile_rest_path="%s"' %
                                       self._options['agile_rest_path'])
@@ -3067,7 +3086,7 @@ class JIRA(object):
         data['ignoreEpics'] = ignore_epics
         url = self._get_url('epics/%s/add' %
                             epic_id, base=self.AGILE_BASE_URL)
-        r = self._session.put(
+        return self._session.put(
             url, data=json.dumps(data))
 
     # TODO: Both GreenHopper and new JIRA Agile API support moving more than one issue.
@@ -3092,7 +3111,7 @@ class JIRA(object):
             url = self._get_url('issue/rank', base=self.AGILE_BASE_URL)
             payload = {'issues': [issue], 'rankBeforeIssue': next_issue, 'rankCustomFieldId': self._rank}
             try:
-                r = self._session.put(url, data=json.dumps(payload))
+                return self._session.put(url, data=json.dumps(payload))
             except JIRAError as e:
                 if e.status_code == 404:
                     warnings.warn('Status code 404 may mean, that too old JIRA Agile version is installed.'
@@ -3103,7 +3122,7 @@ class JIRA(object):
             data = {
                 "issueKeys": [issue], "rankBeforeKey": next_issue, "customFieldId": self._rank}
             url = self._get_url('rank', base=self.AGILE_BASE_URL)
-            r = self._session.put(url, data=json.dumps(data))
+            return self._session.put(url, data=json.dumps(data))
         else:
             raise NotImplementedError('No API for ranking issues for agile_rest_path="%s"' %
                                       self._options['agile_rest_path'])
