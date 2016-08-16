@@ -5,9 +5,6 @@ import tempfile
 class JIRAError(Exception):
 
     """General error raised for all problems in operation of the client."""
-    log_to_tempfile = True
-    if 'TRAVIS' in os.environ:
-        log_to_tempfile = False  # Travis is keeping only the console log.
 
     def __init__(self, status_code=None, text=None, url=None, request=None, response=None, **kwargs):
         self.status_code = status_code
@@ -17,6 +14,7 @@ class JIRAError(Exception):
         self.response = response
         self.headers = kwargs.get('headers', None)
         self.log_to_tempfile = False
+        self.travis = False
         if 'PYJIRA_LOG_TO_TEMPFILE' in os.environ:
             self.log_to_tempfile = True
         if 'TRAVIS' in os.environ:
