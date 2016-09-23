@@ -22,7 +22,7 @@ try:
 
 except Exception as e:
     print(e)
-    
+
     # Get the version - do not use normal import because it does break coverage
     base_path = os.path.dirname(__file__)
     fp = open(os.path.join(base_path, NAME, 'version.py'))
@@ -156,7 +156,7 @@ setup(
     packages=find_packages(exclude=['tests', 'tools']),
     include_package_data=True,
 
-    install_requires=['requests>=2.6.0',
+    install_requires=['requests>=2.2.0',
                       'requests_oauthlib>=0.3.3',
                       'tlslite>=0.4.4',
                       'six>=1.9.0',
