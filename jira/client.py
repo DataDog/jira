@@ -260,7 +260,7 @@ class JIRA(object):
         self._options = copy.copy(JIRA.DEFAULT_OPTIONS)
 
         if options.get('headers'):
-            self._options.get('headers').update(options.get('headers', {}))
+            self._options.get('headers').update(options.get('headers'))
             del options['headers']
 
         self._options.update(options)
